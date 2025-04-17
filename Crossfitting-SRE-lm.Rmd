@@ -1,0 +1,61 @@
+---
+title: "Crossfitting-SRE-lm"
+author: "Lei Shi"
+date: "2025-03-04"
+output: pdf_document
+---
+
+# Setting 3: SRE
+```{r}
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+set.seed(2024)
+
+Nk = c(200, 400, 200)
+Nk1 = c(100, 200, 100)
+Nk0 = Nk - Nk1
+N = sum(Nk)
+
+# generate data
+X1 = rnorm(N)
+X2 = rnorm(N)
+
+full_data = data.frame(
+  Y1 = c(rpois(Nk[1], lambda = exp(0.2 * X1 + 0.2 * X2)),
+         rpois(Nk[2], lambda = exp(0.4 * X1 + 0.4 * X2)),
+         rpois(Nk[3], lambda = exp(0.6 * X1 + 0.6 * X2))),
+  Y0 = c(rpois(Nk[1], lambda = exp(0.1 * X1 + 0.1 * X2)),
+         rpois(Nk[2], lambda = exp(0.2 * X1 + 0.2 * X2)),
+         rpois(Nk[3], lambda = exp(0.3 * X1 + 0.3 * X2))),
+  X1 = X1, 
+  X2 = X2, 
+  strata = rep(c(1,2,3), times = Nk)
+)
+
+tau = mean(full_data$Y1 - full_data$Y0)
+
+MC = 1e3
+result_correct_model = data.frame(
+  tau = rep(tau, MC), 
+  tau_hat_cf = rep(0, MC), 
+  var_hat_cf = rep(0, MC),
+  tau_hat = rep(0, MC),
+  var_hat = rep(0, MC)
+)
+
+result_wrong_model = data.frame(
+  tau = rep(tau, MC), 
+  tau_hat_cf = rep(0, MC), 
+  var_hat_cf = rep(0, MC),
+  tau_hat = rep(0, MC),
+  var_hat = rep(0, MC)
+)
+```
+
+
+
+```{r}
+
+```
+
