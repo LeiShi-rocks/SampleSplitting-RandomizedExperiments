@@ -1,0 +1,416 @@
+---
+title: "CF-Bernoulli"
+author: "Lei Shi"
+date: "2025-04-17"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(car)
+library(purrr)      # map_dfr
+library(progress)   # (nice) progress bar
+library(tibble)
+devtools::install_github("swager/randomForest")
+library(randomForest)
+source("appendix.R")
+```
+
+
+# Set up Experiment
+```{r}
+gamma = 0.7 # rate parameter: d = N^\gamma; also try 0.4, 0.6 later
+N = 3e3
+d = floor(N^gamma)
+beta = c(0, rep(1, d))/sqrt(d) # linear regression coefficients: in R^{d+1}
+
+X = matrix(rt(n = N * d, df = 2), nrow = N, ncol = d)
+
+# center the columns of X
+X0 = apply(X, 2, function(col) col - mean(col)) 
+
+# append an all-one column
+X = cbind(1, X0)
+
+# generate noise
+H = X0 %*% solve(t(X0) %*% X0, t(X0))
+Hplus = X %*% solve(t(X) %*% X, t(X))
+epsilon = (diag(1, nrow = N) - Hplus) %*% diag(H)
+epsilon = sqrt(N) * epsilon/norm(epsilon)
+
+# generate potential outcomes
+Y1 = X %*% beta + epsilon
+# Y1 = rnorm(N, 0, 1)
+Y0 = rnorm(N, 0, 0.01)
+
+# true effects
+tau = mean(Y1 - Y0)
+print(tau)
+```
+
+```{r}
+# Treatment generation (Bernoulli randomization)
+prob = 0.5
+Z = rbinom(N, 1, prob)
+N1 = sum(Z)
+N0 = sum(1-Z)
+
+# data
+dat = data.frame(
+  ID = 1:N, 
+  X0,
+  Z = Z, 
+  Y1 = Y1,
+  Y0 = Y0,
+  Y = Y1 * Z + Y0 * (1-Z)
+)
+```
+
+
+Now see how things work: 
+
+```{r}
+DIM(dat)
+LIN(dat)
+LD(dat)
+DC(dat, 0.5)
+CF(dat, 0.5, 0.5)
+```
+```{r}
+#######################################################################
+## 1.  Make Population  ----------------------------------------
+#######################################################################
+make_population <- function(N,
+                            gamma = 0.7) {
+
+  d    <- floor(N^gamma)
+  beta <- c(0, rep(1, d)) / sqrt(d)
+
+  ## covariates --------------------------------------------------------
+  X0 <- matrix(rt(N * d, df = 2), nrow = N, ncol = d)
+  X0 <- sweep(X0, 2, colMeans(X0))              # centre columns
+  X  <- cbind(1, X0)
+
+  ## noise -------------------------------------------------------------
+  H      <- X0 %*% solve(t(X0) %*% X0, t(X0))
+  Hplus  <- X  %*% solve(t(X)  %*% X,  t(X))
+  eps    <- (diag(N) - Hplus) %*% diag(H)
+  eps    <- sqrt(N) * eps / norm(eps, type = "2")
+
+  ## potential outcomes & truth ---------------------------------------
+  Y1  <- X %*% beta + eps
+  Y0  <- rnorm(N, 0, 0.01)
+  tau <- mean(Y1 - Y0)
+
+  ## return tidy data.frame (no Z  /  Y yet)
+  list(
+    data = data.frame(ID = seq_len(N), X0, Y1 = as.numeric(Y1), Y0 = Y0),
+    tau  = tau
+  )
+}
+```
+
+
+```{r}
+#######################################################################
+## 2.  A SINGLE‑RUN SIMULATOR  ----------------------------------------
+#######################################################################
+simulate_once <- function(pop,
+                          prob.T = 0.5) {
+
+  dat <- pop$data
+  N   <- nrow(dat)
+
+  ## treatment ---------------------------------------------------------
+  dat$Z <- rbinom(N, 1, prob.T)
+  dat$Y <- with(dat, Y1*Z + Y0*(1 - Z))
+
+  ## estimators --------------------------------------------------------
+  est <- list(
+    DIM = DIM(dat),
+    LIN = LIN(dat),
+    LD  = LD(dat),
+    DC  = DC(dat, prob.T),
+    CF  = CF(dat, prob.T, 0.5)
+  )
+
+  ## build one‑row tibbles with purrr::map()  --------------------------
+  res_list <- map(names(est), function(m){
+    out <- est[[m]]
+    tibble(
+      method   = m,
+      tau_true = pop$tau,
+      tau_hat  = out[[grep("^tau", names(out))]],
+      var_hat  = out[[grep("^var", names(out))]]
+    )
+  })
+
+  ## collapse to a data frame (five rows) -----------------------------
+  list_rbind(res_list)
+}
+```
+
+```{r}
+pop = make_population(1e3)
+simulate_once(pop, 0.5)
+```
+
+
+```{r}
+#######################################################################
+## 3.  FULL MONTE‑CARLO DRIVER  ---------------------------------------
+#######################################################################
+run_mc <- function(gamma.grid = c(0.3, 0.4, 0.5, 0.6, 0.7),
+                   MC     = 20,
+                   seed   = 20250419,
+                   N = 2e3) {
+
+  set.seed(seed)
+  pb <- progress_bar$new(
+          format = "running [:bar] :percent ETA: :eta",
+          total  = length(gamma.grid) * MC,
+          clear  = FALSE, width = 60)
+
+  ## outer loop over N  -----------------------------------------------
+  outer_list <- map(gamma.grid, function(gamma) {
+    pop <- make_population(N, gamma)              # built once per N
+
+    ## inner loop over MC reps  ---------------------------------------
+    inner_list <- map(seq_len(MC), function(rep){
+      pb$tick()
+      simulate_once(pop) |>
+        mutate(gamma = gamma, rep = rep)
+    })
+
+    inner_list                         # list (length = MC)
+  })
+
+  ## flatten every‑thing to one data frame ----------------------------
+  list_rbind(flatten(outer_list))
+}
+```
+
+
+
+```{r}
+#######################################################################
+## 4.  RUN & SUMMARISE  ------------------------------------------------
+#######################################################################
+sim_out <- run_mc(gamma.grid = c(0.3, 0.4, 0.5, 0.6, 0.7),
+                   MC     = 1000,
+                   seed   = 20250419, 
+                   N = 2e3)
+saveRDS(sim_out, file = "simulation-lm.rds")
+```
+
+
+```{r}
+mc_summary <- sim_out |>
+  mutate(sd_hat = sqrt(var_hat),
+         cover  = abs(tau_hat - tau_true) <= 1.96*sd_hat) |>
+  group_by(gamma, method) |>
+  summarise(
+    bias      = mean(tau_hat - tau_true),
+    emp_sd    = sd(tau_hat),
+    mse = bias^2 + emp_sd^2,
+    mean_vhat = mean(var_hat),
+    coverage  = mean(cover),
+    ratio = sqrt(mean_vhat) / emp_sd,
+    .groups   = "drop")
+
+print(mc_summary, n = Inf)
+
+```
+
+# Part 2: Test different splitting ratio
+```{r}
+p_mse <- ggplot(mc_summary, aes(x = gamma, y = mse, colour = method, lty = method, shape = method)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  labs(x = expression(gamma),
+       y = "Monte‑Carlo MSE") +
+  theme_minimal()
+
+p_mse
+```
+
+```{r}
+p_cov <- ggplot(mc_summary, aes(x = gamma, y = coverage, colour = method)) +
+  geom_hline(yintercept = 0.95, linetype = 2, linewidth = 0.4) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  labs(x = expression(gamma),
+       y = "95% coverage rate",
+       colour = NULL) +
+  coord_cartesian(ylim = c(0, 1)) +
+  theme_minimal()
+
+p_cov
+```
+```{r}
+p_ratio <- ggplot(mc_summary, aes(x = gamma, y = ratio, colour = method)) +
+  geom_hline(yintercept = 1, linetype = 2, linewidth = 0.4) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2) +
+  labs(x = expression(gamma),
+       y = expression(overline(hat(v))/SD^2),
+       colour = NULL) +
+  theme_minimal()
+
+p_ratio
+
+```
+
+# Part 3: use of Nonparametric methods
+
+Compare with naive nonparametric methods and no-harm calibration
+
+```{r}
+library(devtools)
+devtools::install_github("swager/randomForest")
+library(randomForest)
+
+# Based on code from swager/randomForest GitHub repo
+ate.randomForest_calibrated = function(X, Y, W, nodesize = 20, conf.level=.9) {
+  
+  if (prod(W %in% c(0, 1)) != 1) {
+    stop("Treatment assignment W must be encoded as 0-1 vector.")
+  }
+  
+  nobs = nrow(X)
+  pobs = ncol(X)
+  
+  if(length(unique(Y)) > 2) {
+    # Sample-Split (two folds)
+    tauVec = numeric(2)
+    tauVec_cal = numeric(2)
+    for(i in 1:2)
+    {
+      # Hold out half of the data points
+      inds = (seq(1, N) %% 2 == (i - 1)) # select based on parity of the index 
+      Y_leaveouti = Y[!inds]
+      X_leaveouti = X[!inds,]
+      W_leaveouti = W[!inds]
+      
+      initialFit0 = rep(NA, length(W_leaveouti))
+      initialFit1 = rep(NA, length(W_leaveouti))
+      
+      yhat.0 = rep(NA, length(W_leaveouti))
+      yhat.1 = rep(NA, length(W_leaveouti))
+      
+      rf_leaveouti.0 = randomForest::randomForest(X_leaveouti[W_leaveouti==0,], Y_leaveouti[W_leaveouti==0], nodesize = nodesize)
+      rf_leaveouti.1 = randomForest::randomForest(X_leaveouti[W_leaveouti==1,], Y_leaveouti[W_leaveouti==1], nodesize = nodesize)
+      
+      # Form the initial predictions based upon the random forests (on the data points that aren't withheld)
+      initialFit0[W_leaveouti==0] = stats::predict(rf_leaveouti.0)
+      initialFit0[W_leaveouti==1] = stats::predict(rf_leaveouti.0, newdata = X_leaveouti[W_leaveouti==1,])
+      initialFit1[W_leaveouti==1] = stats::predict(rf_leaveouti.1)
+      initialFit1[W_leaveouti==0] = stats::predict(rf_leaveouti.1, newdata = X_leaveouti[W_leaveouti==0,])
+      
+      # Initial fit on the held out data
+      tiHat = stats::predict(rf_leaveouti.1, newdata = X[inds,])
+      ciHat = stats::predict(rf_leaveouti.1, newdata = X[inds,])
+      
+      # Form the calibrated predictions using the initial fits as covariates
+      Xtilde = data.frame(initialFit1, initialFit0)
+      Xtilde1 = Xtilde[W_leaveouti==1,]
+      Xtilde0 = Xtilde[W_leaveouti==0,]
+      lm1 = lm(Y_leaveouti[W_leaveouti==1]~., data = Xtilde1)
+      lm0 = lm(Y_leaveouti[W_leaveouti==0]~., data = Xtilde0)
+      calFit1 = predict(lm1, newdata = data.frame(initialFit1 = tiHat, initialFit0 = ciHat))
+      calFit0 = predict(lm0, newdata = data.frame(initialFit1 = tiHat, initialFit0 = ciHat))
+      
+      
+      tauVec[i] = mean((tiHat - ciHat) + W[inds]*(N/n1)*(Y[inds] - tiHat) - (1 - W[inds])*(N/n0)*(Y[inds] - ciHat))
+      tauVec_cal[i] = mean((calFit1 - calFit0) + W[inds]*(N/n1)*(Y[inds] - calFit1) - (1 - W[inds])*(N/n0)*(Y[inds] - calFit0))
+    }
+  } else {
+    cat("Error: Not enough unique values of Y")
+  }
+  
+  list(uncalibrated = mean(tauVec), calibrated = mean(tauVec_cal))
+}
+```
+
+## 
+```{r}
+pop = make_population_pois()
+dat = pop$data
+N = nrow(dat)
+dat$Z = rbinom(N, 1, 0.8)
+dat$Y = with(dat, Y1*Z + Y0*(1 - Z))
+pop$tau
+```
+
+
+## part model fitting
+```{r}
+DIM(dat)
+```
+
+
+```{r}
+gam_unadj = part_fit(dat, model_id = rep(1, N), est_id = rep(1, N), method = "gam", calibration = F)
+gam_cal = part_fit(dat, model_id = rep(1, N), est_id = rep(1, N), method = "gam", calibration = T)
+rf_unadj = part_fit(dat, model_id = rep(1, N), est_id = rep(1, N), method = "rf", calibration = F)
+rf_cal = part_fit(dat, model_id = rep(1, N), est_id = rep(1, N), method = "rf", calibration = T)
+pois_unadj = part_fit(dat, model_id = rep(1, N), est_id = rep(1, N), method = "poisson", calibration = F)
+pois_cal = part_fit(dat, model_id = rep(1, N), est_id = rep(1, N), method = "poisson", calibration = T)
+
+
+fits <- list(
+  DIM = DIM(dat), 
+  gam_unadj = gam_unadj,
+  gam_cal   = gam_cal,
+  rf_unadj  = rf_unadj,
+  rf_cal    = rf_cal,
+  pois_unadj = pois_unadj,
+  pois_cal   = pois_cal
+)
+
+## extract tauhat and varhat
+results_tbl <- data.frame(
+  estimator = names(fits),
+  tauhat    = vapply(fits, function(x) x$tauhat, numeric(1)),
+  varhat    = vapply(fits, function(x) x$varhat, numeric(1))
+)
+
+results_tbl
+```
+
+```{r}
+probZ = 0.8
+probS = 0.8
+
+fits <- list(
+      DIM              = DIM(dat),
+      gam_uncal_cf        = CF(dat, probZ, probS, "gam",     calibration = FALSE),
+      gam_cal_cf          = CF(dat, probZ, probS, "gam",     calibration = TRUE ),
+      rf_uncal_cf         = CF(dat, probZ, probS, "rf",      calibration = FALSE),
+      rf_cal_cf           = CF(dat, probZ, probS, "rf",      calibration = TRUE ),
+      pois_uncal_cf       = CF(dat, probZ, probS, "poisson", calibration = FALSE),
+      pois_cal_cf         = CF(dat, probZ, probS, "poisson", calibration = TRUE )
+#      pois_wrong_unadj = part_fit(dat, rep(1, N), rep(1, N), "poisson",
+#                                  calibration = FALSE,
+#                                  model_opts = list(xvars = paste0("X", 1:5))),
+#      pois_wrong_cal   = part_fit(dat, rep(1, N), rep(1, N), "poisson",
+#                                  calibration = TRUE,
+#                                  model_opts = list(xvars = paste0("X", 1:5)))
+    )
+
+## extract tauhat and varhat
+results_tbl <- data.frame(
+  estimator = names(fits),
+  tauhat    = vapply(fits, function(x) x$tauhat, numeric(1)),
+  varhat    = vapply(fits, function(x) x$varhat, numeric(1))
+)
+
+results_tbl
+```
+

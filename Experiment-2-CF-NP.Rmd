@@ -1,0 +1,671 @@
+---
+title: "Experiment-2-CF-NP"
+author: "Lei Shi"
+date: "2025-04-20"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(car)
+library(purrr)      # map_dfr
+library(progress)   # (nice) progress bar
+library(tibble)
+library(mgcv)
+library(randomForest)
+library(ggbreak)
+library(scales)
+source("appendix.R")
+```
+
+# Experiment 2: testing non-parametric fitting
+
+In this experiment, we run: 
+- GAM
+- random forest
+- Kernel method
+for ATE estimation. 
+
+In parallel, we evaluate the performance of inference with no-harm calibration. 
+
+```{r}
+# Create a function to generate a population with N units and a quadratic potential outcome model:
+make_population_pois = function(N = 5e2, d = 1){
+  X = matrix(runif(N * d, min = -5, max = 5), nrow = N, ncol = d)/d
+  # X = matrix(rnorm(N*d), nrow = N, ncol = d)/sqrt(d)
+  
+  beta0 = rep(0, d)  
+  beta0[1] = sqrt(d)
+  beta1 = rep(1, d)
+
+  Y1 = rpois(N, lambda = exp(X %*% beta1))
+  Y0 = rpois(N, lambda = 1.8 * (40 - .25*exp(X %*% beta0)))
+  # Y0 = rpois(N, lambda = 3 + exp(X %*% beta0))
+  
+  tau = mean(Y1 - Y0)
+  
+  list(
+    data = data.frame(ID = seq_len(N), X, Y1 = as.numeric(Y1), Y0 = Y0),
+    tau  = tau
+  )
+}
+```
+
+
+
+
+
+
+## Parallel computing -- Poisson
+```{r}
+# ------------------------------------------------------------------
+# 0.  parallel back‑end + progress bar  -----------------------------
+# ------------------------------------------------------------------
+library(doSNOW)         # <- doSNOW supports a progress function
+library(foreach)
+library(progress)       # nice bar
+
+n_cores <- 6
+cl <- makeCluster(n_cores)
+registerDoSNOW(cl)
+
+# Monte‑Carlo settings
+probZ  <- 0.8
+probS  <- 0.5
+n_pop  <- 1
+n_rand <- 500
+set.seed(20250421)
+
+# one bar for the *inner* loop (updated by every worker)
+pb <- progress_bar$new(
+  format  = "sim :current/:total [:bar] :percent eta: :eta",
+  total   = n_pop * n_rand,
+  clear   = FALSE, width = 60)
+
+progress_fun <- function(n) pb$tick()          # callback for doSNOW
+opts <- list(progress = progress_fun)          # pass via .options.snow
+
+# ------------------------------------------------------------------
+# 1.  run simulation  ----------------------------------------------
+# ------------------------------------------------------------------
+all_res <- vector("list", n_pop)
+
+for (p in seq_len(n_pop)) {
+
+  pop      <- make_population_pois(N = 5e2, d = 1)
+  tau_true <- pop$tau
+  Xs       <- pop$data
+
+  pop_res <- foreach(r = seq_len(n_rand),
+                     .combine  = bind_rows,
+                     .packages = c("dplyr", "tibble",
+                                   "mgcv", "randomForest"),
+                     .options.snow = opts) %dopar% {
+
+    dat        <- Xs
+    N          <- nrow(dat)
+    dat$Z      <- rbinom(N, 1, probZ)
+    dat$Y      <- with(dat, Y1*Z + Y0*(1 - Z))
+
+    fits <- list(
+      dim           = DIM(dat),
+#      gam_uncal     = part_fit(dat, rep(1,N), rep(1,N), "gam",     FALSE),
+#      gam_cal       = part_fit(dat, rep(1,N), rep(1,N), "gam",     TRUE ),
+#      rf_uncal      = part_fit(dat, rep(1,N), rep(1,N), "rf",      FALSE),
+#      rf_cal        = part_fit(dat, rep(1,N), rep(1,N), "rf",      TRUE ),
+#      pois_uncal    = part_fit(dat, rep(1,N), rep(1,N), "poisson", FALSE),
+#      pois_cal      = part_fit(dat, rep(1,N), rep(1,N), "poisson", TRUE ),
+      gam_uncal_cf  = CF(dat, probZ, probS, "gam",     FALSE),
+      gam_cal_cf    = CF(dat, probZ, probS, "gam",     TRUE ),
+      rf_uncal_cf   = CF(dat, probZ, probS, "rf",      FALSE),
+      rf_cal_cf     = CF(dat, probZ, probS, "rf",      TRUE ),
+      pois_uncal_cf = CF(dat, probZ, probS, "poisson", FALSE),
+      pois_cal_cf   = CF(dat, probZ, probS, "poisson", TRUE )
+    )
+
+    tibble(
+      pop       = p,
+      rep       = r,
+      estimator = names(fits),
+      tauhat    = vapply(fits, `[[`, numeric(1), "tauhat"),
+      varhat    = vapply(fits, `[[`, numeric(1), "varhat"),
+      tau_true  = tau_true
+    )
+  }
+
+  all_res[[p]] <- pop_res
+}
+
+stopCluster(cl)     # tidy‑up
+
+sim_res <- bind_rows(all_res)
+
+# ------------------------------------------------------------------
+# 2.  summary metrics  ---------------------------------------------
+# ------------------------------------------------------------------
+summary_tbl <- sim_res %>% 
+  group_by(estimator, pop) %>% 
+  summarise(
+    bias        = mean(tauhat - tau_true),
+    mse         = mean((tauhat - tau_true)^2),
+    emp_var     = var(tauhat),
+    mean_varhat = mean(varhat),
+    ratio_var   = mean_varhat / emp_var,
+    coverage    = mean(abs(tauhat - tau_true) <= 1.96 * sqrt(varhat)),
+    .groups = "drop"
+  ) %>% 
+  group_by(estimator) %>% 
+  summarise(across(bias:coverage, mean), .groups = "drop") %>% 
+  arrange(estimator)
+
+knitr::kable(
+  summary_tbl, digits = 4,
+  caption = sprintf("%d populations × %d randomisations — Monte‑Carlo summary",
+                    n_pop, n_rand)
+)
+
+
+```
+
+
+## Run MC
+```{r}
+## ------------------------------------------------------------------
+## 0.  parallel set-up  ---------------------------------------------
+## ------------------------------------------------------------------
+n_cores <- 8
+cl <- makeCluster(n_cores)           # local workers
+registerDoSNOW(cl)
+
+progress_fun <- function(n) pb$tick()
+opts <- list(progress = progress_fun)
+
+## ------------------------------------------------------------------
+## 1.  simulation settings  -----------------------------------------
+## ------------------------------------------------------------------
+gamma_vec <- seq(2.5, 3.1, by = 0.1)       # 2, 2.1, …, 2.6  (length = 7)
+n_pop     <- 50
+n_rand    <- 1000
+
+probZ  <- 0.8
+probS  <- 0.5
+set.seed(20250421)
+
+total_tasks <- length(gamma_vec) * n_pop * n_rand
+pb <- progress_bar$new(
+  format = "sim :current/:total [:bar] :percent eta: :eta",
+  total  = total_tasks, clear = FALSE, width = 60)
+
+## ------------------------------------------------------------------
+## 2.  run simulation  ----------------------------------------------
+## ------------------------------------------------------------------
+all_res <- vector("list", length(gamma_vec))   # γ-level list
+
+for (gidx in seq_along(gamma_vec)) {
+
+  gamma_now <- gamma_vec[gidx]
+  N_this    <- floor(10^gamma_now)
+
+  ## ------- outer loop over 20 populations (sequential) ------------
+  res_pop <- vector("list", n_pop)
+
+  for (p in seq_len(n_pop)) {
+
+    pop      <- make_population_pois(N = N_this, d = 1)
+    tau_true <- pop$tau
+    Xs       <- pop$data
+
+    ## ---- inner randomisations (parallel on 6 cores) ---------------
+    res_rand <- foreach(r = seq_len(n_rand),
+                        .combine  = bind_rows,
+                        .packages = c("dplyr", "tibble",
+                                      "mgcv", "randomForest"),
+                        .options.snow = opts) %dopar% {
+
+      dat        <- Xs
+      N          <- N_this
+      dat$Z      <- rbinom(N_this, 1, probZ)
+      dat$Y      <- with(dat, Y1*Z + Y0*(1 - Z))
+
+      fits <- list(
+        dim              = DIM(dat),
+        gam_uncal_cf     = CF(dat, probZ, probS, "gam",     FALSE),
+        gam_cal_cf       = CF(dat, probZ, probS, "gam",     TRUE ),
+        rf_uncal_cf      = CF(dat, probZ, probS, "rf",      FALSE),
+        rf_cal_cf        = CF(dat, probZ, probS, "rf",      TRUE ),
+        pois_uncal_cf    = CF(dat, probZ, probS, "poisson", FALSE),
+        pois_cal_cf      = CF(dat, probZ, probS, "poisson", TRUE )
+      )
+
+      tibble(
+        gamma     = gamma_now,
+        N         = N,
+        pop       = p,
+        rep       = r,
+        estimator = names(fits),
+        tauhat    = vapply(fits, `[[`, numeric(1), "tauhat"),
+        varhat    = vapply(fits, `[[`, numeric(1), "varhat"),
+        tau_true  = tau_true
+      )
+    } # end foreach
+
+    res_pop[[p]] <- res_rand
+  } # end population loop
+
+  all_res[[gidx]] <- bind_rows(res_pop)
+}
+
+stopCluster(cl)                           # tidy up workers
+sim_res <- bind_rows(all_res)             # final flat tibble
+```
+
+
+```{r}
+saveRDS(sim_res, "sim_res_med.rds")
+```
+
+
+## Summary: median
+
+```{r}
+gamma_vec <- seq(2.5, 3.1, by = 0.1) 
+n_pop     <- 50
+n_rand    <- 100
+sim_res = readRDS("sim_res_med.rds")
+
+summary_tbl <- sim_res %>% 
+  # ── 1. summarise *within* each population ─────────────────────────
+  group_by(gamma, estimator, pop) %>% 
+  summarise(
+    bias        = mean(tauhat - tau_true),
+    mse         = mean((tauhat - tau_true)^2),
+    emp_var     = var(tauhat),
+    mean_varhat = mean(varhat),
+    ratio_var   = mean_varhat / emp_var,
+    coverage    = mean(abs(tauhat - tau_true) <= 1.96 * sqrt(varhat)),
+    .groups = "drop"
+  ) %>% 
+  # ── 2. take the *median* of those pop-level averages ──────────────
+  group_by(gamma, estimator) %>%                       
+  summarise(
+    across(bias:coverage, median, .names = "{.col}_med"),
+    .groups = "drop"
+  ) %>% 
+  arrange(gamma, estimator)
+
+summary_tbl
+```
+
+```{r}
+## ensure estimator is a factor (so linetype / shape work nicely)
+summary_tbl <- summary_tbl %>% 
+  mutate(N = floor(10^gamma),
+         estimator = factor(estimator)) %>% 
+  mutate(estimator = factor(estimator,
+                            levels = c("gam_uncal_cf","gam_cal_cf",
+                                       "rf_uncal_cf","rf_cal_cf",
+                                       "pois_uncal_cf","pois_cal_cf",
+                                       "dim"),
+                            labels = c("GAM – uncal",
+                                       "GAM – cal",
+                                       "RF – uncal",
+                                       "RF – cal",
+                                       "Poisson – uncal",
+                                       "Poisson – cal",
+                                       "Diff-in-Means")))
+
+## sample-size ticks -------------------------------------------------
+gamma_vec <- seq(2.5, 3.1, by = .1)
+N_ticks   <- floor(10^gamma_vec)
+fontsize = 30
+
+
+log_x <- scale_x_log10(breaks = N_ticks, minor_breaks = NULL, labels = N_ticks)
+
+
+## ---------- 1) MSE  (log-log) -------------------------------------
+p_mse <- summary_tbl %>% 
+  ggplot(aes(N, mse_med,
+             colour = estimator,
+             linetype = estimator,
+             shape = estimator,
+             group = estimator)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 5, stroke = .4) +
+  scale_shape_manual(values = c(0, 1, 2, 3, 4, 5, 6)) +
+  log_x +
+  scale_y_log10(labels = label_number(accuracy = .001)) +
+  labs(# title = "Mean-squared error",
+       x = "Sample size N",
+       y = "MSE") +
+  theme_minimal(base_size = fontsize) +
+  theme(plot.title  = element_text(face = "bold", hjust = .5),
+        axis.title  = element_text(face = "bold"),
+        legend.text  = element_text(face = "bold", size = fontsize),
+        legend.title  = element_text(face = "bold", size = fontsize),
+        axis.text.x = element_text(face = "bold", size = fontsize), 
+        axis.text.y = element_text(face = "bold", size = fontsize))
+#        legend.position = "none")
+
+
+## ---------- 2) Coverage (0.85 – 1.00) -----------------------------
+p_cov <- summary_tbl %>% 
+  ggplot(aes(N, coverage_med,
+             colour = estimator,
+             linetype = estimator,
+             shape = estimator,
+             group = estimator)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 5, stroke = .4) +
+  scale_shape_manual(values = c(0, 1, 2, 3, 4, 5, 6)) +
+  geom_hline(yintercept = .95, linetype = "dashed", colour = "grey40") +
+  coord_cartesian(ylim = c(.85, 1)) +
+  log_x +
+  labs(# title = "Coverage rate",
+       x = "Sample size N",
+       y = "Coverage") +
+  theme_minimal(base_size = fontsize) +
+  theme(plot.title  = element_text(face = "bold", hjust = .5),
+        axis.title  = element_text(face = "bold"),
+        legend.text  = element_text(face = "bold", size = fontsize),
+        legend.title  = element_text(face = "bold", size = fontsize),
+        axis.text.x = element_text(face = "bold", size = fontsize), 
+        axis.text.y = element_text(face = "bold", size = fontsize))
+#        legend.position = "none")
+
+
+## ---------- 3) Variance ratio (linear y + break) ------------------
+p_ratio <- summary_tbl %>% 
+  ggplot(aes(N, ratio_var_med,
+             colour = estimator,
+             linetype = estimator,
+             shape = estimator,
+             group = estimator)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 5, stroke = 0.4) +
+  scale_shape_manual(values = c(0, 1, 2, 3, 4, 5, 6)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey40") +
+  log_x +
+  scale_y_break(c(2, 5), scales = .3, space = .7) +
+  labs(# title = "Variance ratio",
+       x = "Sample size N",
+       y = "Ratio") +
+  theme_minimal(base_size = fontsize) +
+  theme(
+    axis.text.x.top         = element_blank(),
+    axis.ticks.length.x.top = unit(0, "pt"),
+    legend.text  = element_text(face = "bold", size = fontsize),
+    legend.title  = element_text(face = "bold", size = fontsize),
+    plot.title  = element_text(face = "bold", hjust = .4),
+    axis.title.y  = element_text(face = "bold"),
+    axis.title.x  = element_text(face = "bold", hjust = .35),
+    axis.text.x = element_text(face = "bold", size = fontsize), 
+    axis.text.y = element_text(face = "bold", size = fontsize)
+  )
+
+
+## 5) combine --------------------------------------------------------
+p_mse
+p_cov
+p_ratio
+```
+
+```{r}
+## 6) save the plots
+ggsave("np_mse.png",
+       plot   = p_mse,
+       width  = 10,          # inches
+       height = 6,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+
+ggsave("np_cov.png",
+       plot   = p_cov,
+       width  = 10,          # inches
+       height = 6,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+
+ggsave("np_ratio.png",
+       plot   = p_ratio,
+       width  = 10,          # inches
+       height = 6,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+```
+
+```{r}
+library(ggpubr)    # for ggarrange()
+
+## ---- 3-panel row with one shared legend at the bottom -------------
+p_ratio_flat = ggplotify::as.ggplot(p_ratio)
+
+combined <- ggarrange(
+  p_mse, p_cov, p_ratio,
+  ncol          = 3,          # one row
+  nrow          = 1,
+  common.legend = TRUE,       # merge all guides
+  legend        = "bottom"    # place legend underneath
+)
+
+combined
+
+ggsave("np.png",
+       plot   = combined,
+       width  = 24.0,          # inches
+       height = 6,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+```
+
+
+## Summary: average
+```{r}
+gamma_vec <- seq(2.5, 3.1, by = 0.1) 
+n_pop     <- 50
+n_rand    <- 100
+sim_res = readRDS("sim_res.rds")
+## ------------------------------------------------------------------
+## 3.  summary metrics  ---------------------------------------------
+## ------------------------------------------------------------------
+summary_tbl <- sim_res %>% 
+  group_by(gamma, estimator, pop) %>%              # (γ, method, pop)
+  summarise(
+    bias        = mean(tauhat - tau_true),
+    mse         = mean((tauhat - tau_true)^2),
+    emp_var     = var(tauhat),
+    mean_varhat = mean(varhat),
+    ratio_var   = mean_varhat / emp_var,
+    coverage    = mean(abs(tauhat - tau_true) <= 1.96 * sqrt(varhat)),
+    .groups = "drop"
+  ) %>%                                            # now one row / (γ, method)
+  group_by(gamma, estimator) %>%                   # average over 20 pops
+  summarise(across(bias:coverage, mean), .groups = "drop") %>% 
+  arrange(gamma, estimator)
+
+knitr::kable(
+  summary_tbl, digits = 4,
+  caption = sprintf(
+    "γ ∈ %s;   %d populations × %d randomisations each — Monte-Carlo summary",
+    paste(gamma_vec, collapse = ", "),
+    n_pop, n_rand)
+)
+
+```
+
+
+```{r}
+## ensure estimator is a factor (so linetype / shape work nicely)
+summary_tbl <- summary_tbl %>% 
+  mutate(N = floor(10^gamma),
+         estimator = factor(estimator)) %>% 
+  mutate(estimator = factor(estimator,
+                            levels = c("gam_uncal_cf","gam_cal_cf",
+                                       "rf_uncal_cf","rf_cal_cf",
+                                       "pois_uncal_cf","pois_cal_cf",
+                                       "dim"),
+                            labels = c("GAM – uncal",
+                                       "GAM – cal",
+                                       "RF – uncal",
+                                       "RF – cal",
+                                       "Poisson – uncal",
+                                       "Poisson – cal",
+                                       "Diff-in-Means")))
+
+## sample-size ticks -------------------------------------------------
+gamma_vec <- seq(2.5, 3.1, by = .1)
+N_ticks   <- floor(10^gamma_vec)
+fontsize = 30
+
+
+log_x <- scale_x_log10(breaks = N_ticks, minor_breaks = NULL, labels = N_ticks)
+
+
+## ---------- 1) MSE  (log-log) -------------------------------------
+p_mse <- summary_tbl %>% 
+  ggplot(aes(N, mse,
+             colour = estimator,
+             linetype = estimator,
+             shape = estimator,
+             group = estimator)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 3, stroke = .4) +
+  scale_shape_manual(values = c(0, 1, 2, 3, 4, 5, 6)) +
+  log_x +
+  scale_y_log10(labels = label_number(accuracy = .001)) +
+  labs(# title = "Mean-squared error",
+       x = "Sample size N",
+       y = "MSE") +
+  theme_minimal(base_size = fontsize) +
+  theme(plot.title  = element_text(face = "bold", hjust = .5),
+        axis.title  = element_text(face = "bold"),
+        legend.text  = element_text(face = "bold", size = fontsize),
+        legend.title  = element_text(face = "bold", size = fontsize),
+        axis.text.x = element_text(face = "bold", size = fontsize), 
+        axis.text.y = element_text(face = "bold", size = fontsize))
+#        legend.position = "none")
+
+
+## ---------- 2) Coverage (0.85 – 1.00) -----------------------------
+p_cov <- summary_tbl %>% 
+  ggplot(aes(N, coverage,
+             colour = estimator,
+             linetype = estimator,
+             shape = estimator,
+             group = estimator)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 3, stroke = .4) +
+  scale_shape_manual(values = c(0, 1, 2, 3, 4, 5, 6)) +
+  geom_hline(yintercept = .95, linetype = "dashed", colour = "grey40") +
+  coord_cartesian(ylim = c(.85, 1)) +
+  log_x +
+  labs(# title = "Coverage rate",
+       x = "Sample size N",
+       y = "Coverage") +
+  theme_minimal(base_size = fontsize) +
+  theme(plot.title  = element_text(face = "bold", hjust = .5),
+        axis.title  = element_text(face = "bold"),
+        legend.text  = element_text(face = "bold", size = fontsize),
+        legend.title  = element_text(face = "bold", size = fontsize),
+        axis.text.x = element_text(face = "bold", size = fontsize), 
+        axis.text.y = element_text(face = "bold", size = fontsize))
+#        legend.position = "none")
+
+
+## ---------- 3) Variance ratio (linear y + break) ------------------
+p_ratio <- summary_tbl %>% 
+  ggplot(aes(N, ratio_var,
+             colour = estimator,
+             linetype = estimator,
+             shape = estimator,
+             group = estimator)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 3, stroke = 0.4) +
+  scale_shape_manual(values = c(0, 1, 2, 3, 4, 5, 6)) +
+  geom_hline(yintercept = 1, linetype = "dashed", colour = "grey40") +
+  log_x +
+  scale_y_break(c(2, 5), scales = .3, space = .7) +
+  labs(# title = "Variance ratio",
+       x = "Sample size N",
+       y = "Ratio") +
+  theme_minimal(base_size = fontsize) +
+  theme(
+    axis.text.x.top         = element_blank(),
+    axis.ticks.length.x.top = unit(0, "pt"),
+    legend.text  = element_text(face = "bold", size = fontsize),
+    legend.title  = element_text(face = "bold", size = fontsize),
+    plot.title  = element_text(face = "bold", hjust = .4),
+    axis.title.y  = element_text(face = "bold"),
+    axis.title.x  = element_text(face = "bold", hjust = .35),
+    axis.text.x = element_text(face = "bold", size = fontsize), 
+    axis.text.y = element_text(face = "bold", size = fontsize)
+  )
+
+
+## 5) combine --------------------------------------------------------
+p_mse
+p_cov
+p_ratio
+
+## 6) save the plots
+ggsave("np_mse.png",
+       plot   = p_mse,
+       width  = 8,          # inches
+       height = 6,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+
+ggsave("np_cov.png",
+       plot   = p_cov,
+       width  = 8,          # inches
+       height = 6,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+
+ggsave("np_ratio.png",
+       plot   = p_ratio,
+       width  = 9.5,          # inches
+       height = 6,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+```
+
+
+```{r}
+library(ggpubr)    # for ggarrange()
+
+## ---- 3-panel row with one shared legend at the bottom -------------
+p_ratio_flat = ggplotify::as.ggplot(p_ratio)
+
+combined <- ggarrange(
+  p_mse, p_cov, p_ratio,
+  ncol          = 3,          # one row
+  nrow          = 1,
+  common.legend = TRUE,       # merge all guides
+  legend        = "bottom"    # place legend underneath
+)
+
+combined
+
+ggsave("np.png",
+       plot   = combined,
+       width  = 24.0,          # inches
+       height = 6,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+```
+

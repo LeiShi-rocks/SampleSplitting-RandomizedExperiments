@@ -1,0 +1,439 @@
+---
+title: "CF-Bernoulli"
+author: "Lei Shi"
+date: "2025-04-17"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(car)
+library(purrr)      # map_dfr
+library(progress)   # (nice) progress bar
+library(tibble)
+source("appendix.R")
+```
+
+# Part 1: back up functions
+```{r}
+#######################################################################
+## 1.  Make Population  ----------------------------------------
+#######################################################################
+make_population <- function(N,
+                            gamma = 0.7) {
+
+  d    <- floor(N^gamma)
+  beta <- c(0, rep(1, d)) / sqrt(d)
+
+  ## covariates --------------------------------------------------------
+  X0 <- matrix(rt(N * d, df = 2), nrow = N, ncol = d)
+  X0 <- sweep(X0, 2, colMeans(X0))              # centre columns
+  X  <- cbind(1, X0)
+
+  ## noise -------------------------------------------------------------
+  H      <- X0 %*% solve(t(X0) %*% X0, t(X0))
+  Hplus  <- X  %*% solve(t(X)  %*% X,  t(X))
+  eps    <- (diag(N) - Hplus) %*% diag(H)
+  eps    <- sqrt(N) * eps / norm(eps, type = "2")
+
+  ## potential outcomes & truth ---------------------------------------
+  Y1  <- X %*% beta + eps
+  Y0  <- rnorm(N, 0, 0.01)
+  tau <- mean(Y1 - Y0)
+
+  ## return tidy data.frame (no Z  /  Y yet)
+  list(
+    data = data.frame(ID = seq_len(N), X0, Y1 = as.numeric(Y1), Y0 = Y0),
+    tau  = tau
+  )
+}
+```
+
+
+```{r}
+#######################################################################
+## 2.  A SINGLE‑RUN SIMULATOR  ----------------------------------------
+#######################################################################
+simulate_once <- function(pop, prob.T = 0.5) {
+  dat        <- pop$data
+  N          <- nrow(dat)
+  dat$Z      <- rbinom(N, 1, prob.T)
+  dat$Y      <- with(dat, Y1*Z + Y0*(1 - Z))
+
+  ests <- list(
+    DIM = DIM(dat),
+    LIN = LIN(dat),
+    LD  = LD(dat),
+    DC  = DC(dat, prob.T),
+    CF  = CF(dat, prob.T, 0.5))
+
+  # build five one‑row tibbles, keep as list
+  res_list <- lapply(names(ests), function(m) {
+    out <- ests[[m]]
+    tibble(
+      method   = m,
+      tau_hat  = out[[grep("^tau_", names(out))]],
+      var_hat  = out[[grep("^var_", names(out))]],
+      tau_true = pop$tau,
+      sd_hat   = sqrt(out[[grep("^var_", names(out))]]),
+      mse      = (out[[grep("^tau_", names(out))]] - pop$tau)^2,
+      cover    = abs(out[[grep("^tau_", names(out))]] - pop$tau) <=
+                 1.96*sqrt(out[[grep("^var_", names(out))]]))
+  })
+
+  # return one 5‑row data frame
+  list_rbind(res_list)
+}
+```
+
+## Monte Carlo 
+
+```{r}
+pop = make_population(1e3)
+simulate_once(pop, 0.5)
+```
+
+
+```{r}
+###############################################################################
+# 3.  MONTE‑CARLO DRIVER -------------------------------
+###############################################################################
+run_mc <- function(
+  gamma.grid = seq(0.50, 0.75, by = 0.05),
+  n_pop      = 20,
+  MC         = 10,
+  N          = 1000,
+  seed       = 20250420) {
+
+  set.seed(seed)
+  pb <- progress_bar$new(
+          format = "running [:bar] :percent ETA: :eta",
+          total  = length(gamma.grid) * n_pop * MC,
+          clear  = FALSE, width = 60)
+
+  # outer loop over gamma ---------------------------------------------
+  outer_list <- map(gamma.grid, function(gam) {
+
+    pops <- map(seq_len(n_pop), ~make_population(N, gam))   # 20 populations
+
+    # loop over populations (map2) ------------------------------------
+    pop_blocks <- map2(pops, seq_len(n_pop), function(pop, pop_id) {
+
+      # 100 treatment re‑draws ----------------------------------------
+      rep_blocks <- map(seq_len(MC), function(rep_id) {
+        pb$tick()
+        simulate_once(pop) %>% mutate(rep = rep_id)
+      })
+
+      list_rbind(rep_blocks) %>% mutate(pop = pop_id)
+    })
+
+    list_rbind(pop_blocks) %>% mutate(gamma = gam)
+  })
+
+  sim_out <- list_rbind(outer_list)
+
+  # tidy Monte‑Carlo summary per (gamma, pop, method) -----------------
+  mc_summary <- sim_out %>%
+    group_by(gamma, pop, method) %>%
+    summarise(
+      bias      = mean(tau_hat - tau_true),
+      emp_sd    = sd(tau_hat),
+      mse       = mean(mse),
+      mean_vhat = mean(var_hat),
+      coverage  = mean(cover),
+      .groups   = "drop") %>%
+    mutate(ratio = sqrt(mean_vhat) / emp_sd)
+
+  list(raw = sim_out, summary = mc_summary)
+}
+
+
+```
+
+
+
+```{r}
+#######################################################################
+## 4.  RUN & SUMMARISE  ------------------------------------------------
+#######################################################################
+res <- run_mc(gamma.grid = seq(0.50, 0.75, by = 0.05),
+  n_pop      = 10,
+  MC         = 1,
+  N          = 1500,
+  seed       = 20250420)
+```
+
+
+```{r}
+saveRDS(res, file = "simulation-lm.rds")
+```
+
+
+
+# Part 1.5: Parallelization
+```{r}
+run_mc_parallel <- function(
+  gamma.grid = seq(0.50, 0.75, by = 0.05),
+  n_pop      = 20,
+  MC         = 10,
+  N          = 1000,
+  seed       = 20250420,
+  n_cores    = 8   # use all but 1 core
+) {
+
+  ## --------------------------------------------------------------
+  ##  libraries for parallel + progress bar
+  ## --------------------------------------------------------------
+  requireNamespace("furrr")
+  requireNamespace("progressr")
+  requireNamespace("future")
+
+  set.seed(seed)
+  future::plan(multisession, workers = n_cores)
+
+  ## total number of simulate_once() calls (for progress bar)
+  n_total <- length(gamma.grid) * n_pop * MC
+
+  ## --------------------------------------------------------------
+  ##  parallel outer loop over gamma.grid
+  ## --------------------------------------------------------------
+  progressr::with_progress({
+    p <- progressr::progressor(along = 1:n_total)
+
+    outer_list <- furrr::future_map(gamma.grid, function(gam) {
+
+      ## build 20 populations for this γ
+      pops <- purrr::map(seq_len(n_pop), ~ make_population(N, gam))
+
+      ## sequential loop over populations -------------------------
+      pop_blocks <- purrr::imap(pops, function(pop, pop_id) {
+
+        ## 100 Monte-Carlo re-draws -------------------------------
+        rep_blocks <- purrr::map(seq_len(MC), function(rep_id) {
+          out <- simulate_once(pop) %>% dplyr::mutate(rep = rep_id)
+          p()                                   # tick global bar
+          out
+        })
+
+        dplyr::bind_rows(rep_blocks) %>% dplyr::mutate(pop = pop_id)
+      })
+
+      dplyr::bind_rows(pop_blocks) %>% dplyr::mutate(gamma = gam)
+    }, .options = furrr::furrr_options(seed = TRUE))   # reproducible
+  })
+
+  sim_out <- dplyr::bind_rows(outer_list)
+
+  ## --------------------------------------------------------------
+  ##  Monte-Carlo summary
+  ## --------------------------------------------------------------
+  mc_summary <- sim_out %>% 
+    dplyr::group_by(gamma, pop, method) %>% 
+    dplyr::summarise(
+      bias      = mean(tau_hat - tau_true),
+      emp_sd    = sd(tau_hat),
+      mse       = mean(mse),
+      mean_vhat = mean(var_hat),
+      coverage  = mean(cover),
+      .groups   = "drop"
+    ) %>% 
+    dplyr::mutate(ratio = sqrt(mean_vhat) / emp_sd)
+
+  list(raw = sim_out, summary = mc_summary)
+}
+
+```
+
+```{r}
+res_med = run_mc_parallel(
+  gamma.grid = seq(0.50, 0.75, by = 0.05),
+  n_pop      = 50,
+  MC         = 1000,
+  N          = 1500,
+  seed       = 20250420,
+  n_cores    = 8   # use all but 1 core
+)
+```
+
+```{r}
+saveRDS(res_med, "res_med_lm.rds")
+res_med = readRDS("res_med_lm.rds")
+```
+
+
+# Part 2: Visualization
+
+
+
+```{r}
+median_over_pops <- res_med$summary %>%                 # 1 row = 1 (pop, method, γ)
+  group_by(gamma, method) %>%                       # collapse the pop dimension
+  summarise(                                        # median across 20 pops
+    across(
+      c(bias, emp_sd, mse, mean_vhat, coverage, ratio),
+      median, .names = "{.col}_med"
+    ),
+    .groups = "drop"
+  ) %>% 
+  mutate(
+    method = factor(method,
+      levels = c("CF", "DC", "DIM", "LD", "LIN"),
+      labels = c("Cross Fitting",
+                 "Decorrelation",
+                 "Diff-in-Means",
+                 "Debiasing",
+                 "Lin’s Regression"))
+  )
+print(median_over_pops)
+```
+
+
+```{r}
+fontsize = 30
+
+# 1) MSE ---------------------------------------------------------
+p_mse <- ggplot(median_over_pops,
+                aes(x = gamma, y = mse_med, colour = method, lty = method, shape = method)) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 5) +
+  labs(# title = "Mean-squared error",
+       x = "log(d)/log(N)",
+       y = "MSE") +
+  theme_minimal(base_size = fontsize) +
+  theme(plot.title  = element_text(face = "bold", hjust = .5),
+        axis.title  = element_text(face = "bold"),
+        axis.text.x = element_text(face = "bold", size = fontsize), 
+        axis.text.y = element_text(face = "bold", size = fontsize), #legend.location = "none")
+        legend.text  = element_text(face = "bold", size = fontsize),
+        legend.title  = element_text(face = "bold", size = fontsize))
+
+# 2) 95% Coverage ----------------------------------------------
+p_cov <- ggplot(median_over_pops,
+                aes(x = gamma, y = coverage_med, colour = method, lty = method, shape = method)) +
+  geom_hline(yintercept = 0.95, linetype = 2, linewidth = .4) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 5) +
+  labs(# title = "Coverage rate",
+       x = "log(d)/log(N)",
+       y = "Coverage") +
+  coord_cartesian(ylim = c(0, 1)) +
+  theme_minimal(base_size = fontsize) + 
+  theme(plot.title  = element_text(face = "bold", hjust = .5),
+        axis.title  = element_text(face = "bold"),
+        axis.text.x = element_text(face = "bold", size = fontsize), 
+        axis.text.y = element_text(face = "bold", size = fontsize), 
+        legend.position = "none")
+
+# 3)  mean(v̂)/SD² ratio ----------------------------------------
+p_ratio <- ggplot(median_over_pops,
+                  aes(x = gamma, y = ratio_med, colour = method, lty = method, shape = method)) +
+  geom_hline(yintercept = 1, linetype = 2, linewidth = .4) +
+  geom_line(linewidth = 1.5) +
+  geom_point(size = 5) +
+  labs(# title = "Variance ratio",
+       x = "log(d)/log(N)",
+       y = "Ratio") +
+  theme_minimal(base_size = fontsize) + 
+  theme(
+    plot.title  = element_text(face = "bold", hjust = .5),
+    axis.title  = element_text(face = "bold"),
+    axis.text.x = element_text(face = "bold", size = fontsize), 
+    axis.text.y = element_text(face = "bold", size = fontsize),
+    legend.text  = element_text(face = "bold", size = fontsize),
+    legend.title  = element_text(face = "bold", size = fontsize)
+  )
+
+## 5) combine --------------------------------------------------------
+p_mse
+p_cov
+p_ratio
+```
+
+
+```{r}
+## 6) save the plots
+ggsave("lm_mse.png",
+       plot   = p_mse,
+       width  = 10,          # inches
+       height = 6,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+
+ggsave("lm_cov.png",
+       plot   = p_cov,
+       width  = 10,          # inches
+       height = 6,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+
+ggsave("lm_ratio.png",
+       plot   = p_ratio,
+       width  = 10,          # inches
+       height = 6.5,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+```
+
+
+
+Combine the plots
+
+```{r}
+library(ggpubr)    # for ggarrange()
+
+## ---- 3-panel row with one shared legend at the bottom -------------
+combined <- ggarrange(
+  p_mse, p_cov, p_ratio,
+  ncol          = 3,          # one row
+  nrow          = 1,
+  common.legend = TRUE,       # merge all guides
+  legend        = "bottom"    # place legend underneath
+)
+
+combined
+
+ggsave("lm.png",
+       plot   = combined,
+       width  = 24.0,          # inches
+       height = 6,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+```
+
+
+
+
+
+# Part 3: take average
+
+```{r}
+res = readRDS("simulation-lm.rds")
+avg_over_pops <- res$summary %>%           # <- res returned by run_mc()
+  group_by(gamma, method) %>%              # drop the pop dimension
+  summarise(
+    across(c(bias, emp_sd, mse,
+             mean_vhat, coverage, ratio),
+           mean, .names = "{.col}_avg"),
+    .groups = "drop") %>% 
+  mutate(method = factor(method,
+                            levels = c("CF", "DC", "DIM", "LD", "LIN"),
+                            labels = c("Cross Fitting",
+                                       "Decorrelation",
+                                       "Diff-in-Means",
+                                       "Debiasing",
+                                       "Lin's Regression")))
+
+print(avg_over_pops, n = Inf)
+
+```

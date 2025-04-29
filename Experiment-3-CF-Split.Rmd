@@ -1,0 +1,906 @@
+---
+title: "SampleSplitting"
+author: "Lei Shi"
+date: "2024-11-21"
+output: pdf_document
+---
+
+# Setting 1: CRE
+```{r}
+# ──────────────────────────────  PREP  ──────────────────────────────
+library(MASS)       # mvrnorm
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(foreach)
+library(doParallel) # backend for foreach
+library(doRNG)      # reproducible parallel RNG
+source("appendix.R")
+```
+
+## Make the code parallel
+```{r}
+# set up a CRE
+set.seed(2025)
+MC = 2000
+split_setting = c(0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+# num_models = 2
+n1 = 500
+n0 = 500
+n = n1 + n0
+# generate data
+X1 = rnorm(n)
+X2 = rnorm(n)
+Y0 = rpois(n, lambda = exp(0.5 * X1 + 0.5 * X2))
+Y1 = rpois(n, lambda = exp(0.3 * X1 + 0.4 * X2))
+
+# true effect
+tau = mean(Y1 - Y0)
+
+result_correct_model = lapply(1:length(split_setting), 
+                              function (x){
+                                data.frame(
+                                  tau = rep(0, MC),
+                                  tau_hat_0 = rep(0, MC),
+                                  var_hat_0 = rep(0, MC),
+                                  tau_hat_cf = rep(0, MC),
+                                  var_hat_cf = rep(0, MC)
+                                )
+                              })
+
+result_wrong_model = lapply(1:length(split_setting), 
+                            function (x){
+                              data.frame(
+                                tau = rep(0, MC),
+                                tau_hat_0 = rep(0, MC),
+                                var_hat_0 = rep(0, MC),
+                                tau_hat_cf = rep(0, MC),
+                                var_hat_cf = rep(0, MC)
+                              )
+                            })
+```
+
+
+```{r}
+## ──────────────────── 0.  Parallel set-up ─────────────────────────
+n_cores <- 8
+cl      <- makeCluster(n_cores)
+registerDoParallel(cl)          # foreach now knows about the workers
+
+set.seed(2024)                   # reproducible across workers
+for (split_index in seq_along(split_setting)) {
+
+  message("split_index: ", split_index)
+
+  ## ───────── inner loop (iter) now runs in parallel ─────────
+  res <- foreach(iter = 1:MC,
+                 .packages = c("dplyr")) %dopar% {   # everything below is IDENTICAL
+
+    ## ------------------ copy your original iter-body ------------------ ##
+    # observed data
+    Z <- sample(c(rep(1, n1), rep(0, n0)))
+    Y <- Z * Y1 + (1 - Z) * Y0
+
+    # Without calibration 
+    tau_hat_0 <- sum(Y[Z == 1]) / n1 - sum(Y[Z == 0]) / n0
+    var_hat_0 <- var(Y[Z == 1]) / n1 + var(Y[Z == 0]) / n0
+
+    # With splitting and calibration
+    na  <- 300;  nb  <- 300
+    na1 <- na * split_setting[split_index]
+    nb1 <- n1 - na1
+    na0 <- na - na1
+    nb0 <- nb - nb1
+
+    S1 <- sample(c(rep("a", na1), rep("b", nb1)), size = n1)
+    S0 <- sample(c(rep("a", na0), rep("b", nb0)), size = n0)
+
+    S        <- rep(NA, n)
+    S[Z==1]  <- S1
+    S[Z==0]  <- S0
+
+    full_data <- data.frame(
+      Y  = Y,  Z  = Z,
+      X1 = X1, X2 = X2,
+      S  = S
+    )
+    full_data_cf <- full_data
+
+    ## (everything else in your loop is unchanged …)
+    form       <- paste0("Y~", paste0("X", 1:px, collapse = "+"))
+    glm_fit_a1 <- glm(form, data = full_data %>% filter(S=="a" & Z==1), family="poisson")
+    glm_fit_a0 <- glm(form, data = full_data %>% filter(S=="a" & Z==0), family="poisson")
+    glm_fit_b1 <- glm(form, data = full_data %>% filter(S=="b" & Z==1), family="poisson")
+    glm_fit_b0 <- glm(form, data = full_data %>% filter(S=="b" & Z==0), family="poisson")
+
+    pred_a1_of <- predict(glm_fit_a1, newdata = full_data %>% filter(S=="a"), type="response")
+    pred_a0_of <- predict(glm_fit_a0, newdata = full_data %>% filter(S=="a"), type="response")
+    pred_b1_of <- predict(glm_fit_b1, newdata = full_data %>% filter(S=="b"), type="response")
+    pred_b0_of <- predict(glm_fit_b0, newdata = full_data %>% filter(S=="b"), type="response")
+
+    pred1 <- rep(NA, n); pred0 <- rep(NA, n)
+    pred1[S=="a"] <- pred_a1_of; pred0[S=="a"] <- pred_a0_of
+    pred1[S=="b"] <- pred_b1_of; pred0[S=="b"] <- pred_b0_of
+    full_data <- cbind(full_data, pred1, pred0)
+
+    ## cross-fitting
+    pred_a1_cf <- predict(glm_fit_b1, newdata = full_data %>% filter(S=="a"), type="response")
+    pred_a0_cf <- predict(glm_fit_b0, newdata = full_data %>% filter(S=="a"), type="response")
+    pred_b1_cf <- predict(glm_fit_a1, newdata = full_data %>% filter(S=="b"), type="response")
+    pred_b0_cf <- predict(glm_fit_a0, newdata = full_data %>% filter(S=="b"), type="response")
+    pred1[S=="a"] <- pred_a1_cf; pred0[S=="a"] <- pred_a0_cf
+    pred1[S=="b"] <- pred_b1_cf; pred0[S=="b"] <- pred_b0_cf
+    full_data_cf <- cbind(full_data_cf, pred1, pred0)
+
+    ## linear calibration
+    lm_fit_a1 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="a" & Z==1))
+    lm_fit_a0 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="a" & Z==0))
+    lm_fit_b1 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="b" & Z==1))
+    lm_fit_b0 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="b" & Z==0))
+
+    pred_a1_cf_lc <- predict(lm_fit_b1, newdata = full_data_cf %>% filter(S=="a"))
+    pred_a0_cf_lc <- predict(lm_fit_b0, newdata = full_data_cf %>% filter(S=="a"))
+    pred_b1_cf_lc <- predict(lm_fit_a1, newdata = full_data_cf %>% filter(S=="b"))
+    pred_b0_cf_lc <- predict(lm_fit_a0, newdata = full_data_cf %>% filter(S=="b"))
+
+    pred1_lc <- rep(NA, n); pred0_lc <- rep(NA, n)
+    pred1_lc[S=="a"] <- pred_a1_cf_lc; pred0_lc[S=="a"] <- pred_a0_cf_lc
+    pred1_lc[S=="b"] <- pred_b1_cf_lc; pred0_lc[S=="b"] <- pred_b0_cf_lc
+    full_data_cf <- cbind(full_data_cf, pred1_lc, pred0_lc)
+
+    full_data_cf <- full_data_cf %>% 
+      mutate(epsilon = case_when(
+        Z == 1 ~ Y - pred1_lc,
+        Z == 0 ~ Y - pred0_lc
+      ))
+
+    ## estimator
+    mu_cf_a1 <- 1/na * sum(full_data_cf$epsilon[S=="a" & Z==1])/(na1/na) +
+                1/na * sum(pred1_lc[S=="a"])
+    mu_cf_a0 <- 1/na * sum(full_data_cf$epsilon[S=="a" & Z==0])/(na0/na) +
+                1/na * sum(pred0_lc[S=="a"])
+    mu_cf_b1 <- 1/nb * sum(full_data_cf$epsilon[S=="b" & Z==1])/(nb1/nb) +
+                1/nb * sum(pred1_lc[S=="b"])
+    mu_cf_b0 <- 1/nb * sum(full_data_cf$epsilon[S=="b" & Z==0])/(nb0/nb) +
+                1/nb * sum(pred0_lc[S=="b"])
+
+    tau_hat_cf <- na/n * (mu_cf_a1 - mu_cf_a0) +
+                  nb/n * (mu_cf_b1 - mu_cf_b0)
+
+    var_hat_cf <- na^2/n^2 * (var(full_data_cf$epsilon[S=="a" & Z==1]) / na1 +
+                              var(full_data_cf$epsilon[S=="a" & Z==0]) / na0) +
+                  nb^2/n^2 * (var(full_data_cf$epsilon[S=="b" & Z==1]) / nb1 +
+                              var(full_data_cf$epsilon[S=="b" & Z==0]) / nb0)
+
+    ## hand back the five numbers for this iter
+    c(tau_hat_0  = tau_hat_0,
+      var_hat_0  = var_hat_0,
+      tau_hat_cf = tau_hat_cf,
+      var_hat_cf = var_hat_cf)
+  } ## end foreach
+
+  ## ------------ store into your original list format -------------
+  res_mat <- do.call(rbind, res)
+
+  result_correct_model[[split_index]]$tau         <- rep(tau, MC)
+  result_correct_model[[split_index]]$tau_hat_0   <- res_mat[, "tau_hat_0" ]
+  result_correct_model[[split_index]]$var_hat_0   <- res_mat[, "var_hat_0" ]
+  result_correct_model[[split_index]]$tau_hat_cf  <- res_mat[, "tau_hat_cf"]
+  result_correct_model[[split_index]]$var_hat_cf  <- res_mat[, "var_hat_cf"]
+}
+
+stopCluster(cl)       # tidy-up
+
+```
+
+```{r}
+## ────────────── Parallel version of the “wrong-model” simulation ──────────────
+n_cores <- max(1, parallel::detectCores() - 1)
+cl      <- makeCluster(n_cores)
+registerDoParallel(cl)
+
+set.seed(2024)
+for (split_index in seq_along(split_setting)) {
+
+  message("split_index: ", split_index)
+
+  ## ─── inner MC loop in parallel ───
+  res <- foreach(iter = 1:MC, .packages = "dplyr") %dopar% {
+
+    ## -------------- ORIGINAL BODY (unchanged) --------------
+    Z <- sample(c(rep(1, n1), rep(0, n0)))
+    Y <- Z * Y1 + (1 - Z) * Y0
+
+    tau_hat_0 <- sum(Y[Z==1]) / n1 - sum(Y[Z==0]) / n0
+    var_hat_0 <- var(Y[Z==1]) / n1 + var(Y[Z==0]) / n0
+
+    na  <- 300;  nb  <- 300
+    na1 <- na * split_setting[split_index]
+    nb1 <- n1 - na1
+    na0 <- na - na1
+    nb0 <- nb - nb1
+
+    S1 <- sample(c(rep("a", na1), rep("b", nb1)), size = n1)
+    S0 <- sample(c(rep("a", na0), rep("b", nb0)), size = n0)
+
+    S        <- rep(NA, n)
+    S[Z==1]  <- S1
+    S[Z==0]  <- S0
+
+    full_data <- data.frame(
+      Y  = Y,  Z  = Z,
+      X1 = X1, X2 = X2,
+      S  = S
+    )
+    full_data_cf <- full_data
+
+    form       <- paste0("Y~", paste0("X", 1:ceiling(px/2), collapse = "+"))
+    glm_fit_a1 <- glm(form, data = full_data %>% filter(S=="a"&Z==1), family="poisson")
+    glm_fit_a0 <- glm(form, data = full_data %>% filter(S=="a"&Z==0), family="poisson")
+    glm_fit_b1 <- glm(form, data = full_data %>% filter(S=="b"&Z==1), family="poisson")
+    glm_fit_b0 <- glm(form, data = full_data %>% filter(S=="b"&Z==0), family="poisson")
+
+    pred_a1_of <- predict(glm_fit_a1, newdata = full_data %>% filter(S=="a"), type="response")
+    pred_a0_of <- predict(glm_fit_a0, newdata = full_data %>% filter(S=="a"), type="response")
+    pred_b1_of <- predict(glm_fit_b1, newdata = full_data %>% filter(S=="b"), type="response")
+    pred_b0_of <- predict(glm_fit_b0, newdata = full_data %>% filter(S=="b"), type="response")
+
+    pred1 <- rep(NA, n); pred0 <- rep(NA, n)
+    pred1[S=="a"] <- pred_a1_of; pred0[S=="a"] <- pred_a0_of
+    pred1[S=="b"] <- pred_b1_of; pred0[S=="b"] <- pred_b0_of
+    full_data <- cbind(full_data, pred1, pred0)
+
+    pred_a1_cf <- predict(glm_fit_b1, newdata = full_data %>% filter(S=="a"), type="response")
+    pred_a0_cf <- predict(glm_fit_b0, newdata = full_data %>% filter(S=="a"), type="response")
+    pred_b1_cf <- predict(glm_fit_a1, newdata = full_data %>% filter(S=="b"), type="response")
+    pred_b0_cf <- predict(glm_fit_a0, newdata = full_data %>% filter(S=="b"), type="response")
+    pred1[S=="a"] <- pred_a1_cf; pred0[S=="a"] <- pred_a0_cf
+    pred1[S=="b"] <- pred_b1_cf; pred0[S=="b"] <- pred_b0_cf
+    full_data_cf <- cbind(full_data_cf, pred1, pred0)
+
+    lm_fit_a1 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="a"&Z==1))
+    lm_fit_a0 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="a"&Z==0))
+    lm_fit_b1 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="b"&Z==1))
+    lm_fit_b0 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="b"&Z==0))
+
+    pred_a1_cf_lc <- predict(lm_fit_b1, newdata = full_data_cf %>% filter(S=="a"))
+    pred_a0_cf_lc <- predict(lm_fit_b0, newdata = full_data_cf %>% filter(S=="a"))
+    pred_b1_cf_lc <- predict(lm_fit_a1, newdata = full_data_cf %>% filter(S=="b"))
+    pred_b0_cf_lc <- predict(lm_fit_a0, newdata = full_data_cf %>% filter(S=="b"))
+
+    pred1_lc <- rep(NA, n); pred0_lc <- rep(NA, n)
+    pred1_lc[S=="a"] <- pred_a1_cf_lc; pred0_lc[S=="a"] <- pred_a0_cf_lc
+    pred1_lc[S=="b"] <- pred_b1_cf_lc; pred0_lc[S=="b"] <- pred_b0_cf_lc
+    full_data_cf <- cbind(full_data_cf, pred1_lc, pred0_lc)
+
+    full_data_cf <- full_data_cf %>% 
+      mutate(epsilon = case_when(
+        Z == 1 ~ Y - pred1_lc,
+        Z == 0 ~ Y - pred0_lc
+      ))
+
+    mu_cf_a1 <- 1/na * sum(full_data_cf$epsilon[S=="a"&Z==1])/(na1/na) +
+                1/na * sum(pred1_lc[S=="a"])
+    mu_cf_a0 <- 1/na * sum(full_data_cf$epsilon[S=="a"&Z==0])/(na0/na) +
+                1/na * sum(pred0_lc[S=="a"])
+    mu_cf_b1 <- 1/nb * sum(full_data_cf$epsilon[S=="b"&Z==1])/(nb1/nb) +
+                1/nb * sum(pred1_lc[S=="b"])
+    mu_cf_b0 <- 1/nb * sum(full_data_cf$epsilon[S=="b"&Z==0])/(nb0/nb) +
+                1/nb * sum(pred0_lc[S=="b"])
+
+    tau_hat_cf <- na/n * (mu_cf_a1 - mu_cf_a0) +
+                  nb/n * (mu_cf_b1 - mu_cf_b0)
+
+    var_hat_cf <- na^2/n^2 * (var(full_data_cf$epsilon[S=="a"&Z==1]) / na1 +
+                              var(full_data_cf$epsilon[S=="a"&Z==0]) / na0) +
+                  nb^2/n^2 * (var(full_data_cf$epsilon[S=="b"&Z==1]) / nb1 +
+                              var(full_data_cf$epsilon[S=="b"&Z==0]) / nb0)
+
+    c(tau_hat_0  = tau_hat_0,
+      var_hat_0  = var_hat_0,
+      tau_hat_cf = tau_hat_cf,
+      var_hat_cf = var_hat_cf)
+  }  ## end foreach
+
+  ## put results into the original list structure
+  res_mat <- do.call(rbind, res)
+
+  result_wrong_model[[split_index]]$tau         <- rep(tau, MC)
+  result_wrong_model[[split_index]]$tau_hat_0   <- res_mat[, "tau_hat_0" ]
+  result_wrong_model[[split_index]]$var_hat_0   <- res_mat[, "var_hat_0" ]
+  result_wrong_model[[split_index]]$tau_hat_cf  <- res_mat[, "tau_hat_cf"]
+  result_wrong_model[[split_index]]$var_hat_cf  <- res_mat[, "var_hat_cf"]
+}
+
+stopCluster(cl)
+
+```
+
+## Summarize results
+### combined results
+```{r}
+# combined data
+combined_results_correct_model = do.call(rbind, lapply(1:length(split_setting), function(i) {
+  # Add a "setting" column to each data frame
+  result_correct_model[[i]]$setting = split_setting[i]
+  return(result_correct_model[[i]])
+}))
+
+combined_results_wrong_model = do.call(rbind, lapply(1:length(split_setting), function(i) {
+  # Add a "setting" column to each data frame
+  result_wrong_model[[i]]$setting = split_setting[i]
+  return(result_wrong_model[[i]])
+}))
+```
+
+### plot variance comparisons
+```{r}
+# get mean variance without cross-fitting
+var_0 = var(c(combined_results_correct_model$tau_hat_0, 
+              combined_results_wrong_model$tau_hat_0))
+var_hat_0 = mean(c(combined_results_correct_model$var_hat_0, 
+                   combined_results_wrong_model$var_hat_0))
+
+# get summary data for variance
+summary_var = rbind(
+  combined_results_correct_model %>%
+    group_by(setting) %>%
+    summarize(
+      var_cf = var(tau_hat_cf),
+      var_hat_cf = mean(var_hat_cf)
+    ) %>%
+    mutate(model = "correct"), 
+  combined_results_wrong_model %>%
+    group_by(setting) %>%
+    summarize(
+      var_cf = var(tau_hat_cf),
+      var_hat_cf = mean(var_hat_cf)
+    ) %>%
+    mutate(model = "wrong")
+) 
+
+  
+summary_var %>% ggplot() +
+  geom_line(aes(x = setting, y = var_cf, col = model)) + 
+  geom_point(aes(x = setting, y = var_cf, col = model)) + 
+  geom_hline(yintercept = var_0, lty = 2) + 
+  theme_gray()
+
+summary_var %>% ggplot() +
+  geom_line(aes(x = setting, y = var_hat_cf, col = model)) + 
+  geom_point(aes(x = setting, y = var_hat_cf, col = model)) + 
+  geom_hline(yintercept = var_hat_0, lty = 2) + 
+  theme_gray()
+```
+
+### Distribution check
+```{r}
+# At the optimal variance case, the distribution is asymptotically normal
+result_correct_model[[4]] %>%
+  ggplot() +
+  geom_histogram(aes(x = tau_hat_cf), col = "white", bins = 25)
+
+result_wrong_model[[4]] %>%
+  ggplot() +
+  geom_histogram(aes(x = tau_hat_cf), col = "white", bins = 25)
+```
+
+### bias check
+```{r}
+combined_results_correct_model %>%
+  ggplot() + 
+  geom_boxplot(aes(x = factor(setting), y = tau_hat_cf-tau, fill = factor(setting)))
+```
+
+
+
+# Setting 2
+```{r}
+# ─────────────────────────  Setup  ──────────────────────────
+library(doSNOW)   # SOCK cluster + foreach progress hooks
+library(foreach)
+library(dplyr)
+
+## edit here if you want more seeds
+seeds <- 1:50                   # 50 different populations
+MC    <- 1000L                  # Monte-Carlo reps per split
+split_setting <- c(0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+
+## fixed sample sizes
+n1 <- 500L;  n0 <- 500L;  n <- n1 + n0
+na <- 500L;  nb <- 500L    # split sample sizes
+
+## cluster --------------------------------------------------------------------
+n_cores <- max(1, 8)
+cl      <- makeCluster(n_cores, type = "SOCK")
+registerDoSNOW(cl)
+
+all_runs <- vector("list", length(seeds))
+
+# ─────────────────────  Loop over seeds  ─────────────────────
+for (s in seq_along(seeds)) {
+
+  seed_val <- 2025 + seeds[s]
+  set.seed(seed_val)
+
+  ## population ---------------------------------------------------------------
+  X1 <- rnorm(n)
+  X2 <- rnorm(n)
+  
+  beta0 = rt(2, df = 3)
+  beta0 = beta0/sqrt(sum(beta0^2))
+  beta1 = rt(2, df = 3)
+  beta1 = beta0/sqrt(sum(beta0^2))
+  
+  Y0 <- rpois(n, lambda = exp(0.5*X1 + 0.5*X2))
+  Y1 <- rpois(n, lambda = exp(0.3*X1 + 0.4*X2))
+  tau <- mean(Y1 - Y0)
+  px  <- 2L
+
+  ## helpers ------------------------------------------------------------------
+  init_df <- function() data.frame(
+    tau        = numeric(MC),
+    tau_hat_0  = numeric(MC),
+    var_hat_0  = numeric(MC),
+    tau_hat_cf = numeric(MC),
+    var_hat_cf = numeric(MC)
+  )
+  result_correct_model <- replicate(length(split_setting), init_df(), simplify = FALSE)
+  result_wrong_model   <- replicate(length(split_setting), init_df(), simplify = FALSE)
+
+  # ============== 1) CORRECT-MODEL loop =====================================
+  for (split_index in seq_along(split_setting)) {
+
+    ## progress bar for this MC run
+    pb <- txtProgressBar(min = 0, max = MC, style = 3)
+    prog <- function(n) setTxtProgressBar(pb, n)
+    opts <- list(progress = prog)
+
+    res <- foreach(iter = 1:MC, .packages = "dplyr",
+                   .options.snow = opts) %dopar% {
+
+      ## Monte-Carlo replicate (model code unchanged) -------------------------
+      Z <- sample(c(rep(1L, n1), rep(0L, n0)))
+      Y <- Z * Y1 + (1 - Z) * Y0
+
+      tau_hat_0 <- mean(Y[Z == 1]) - mean(Y[Z == 0])
+      var_hat_0 <- var(Y[Z == 1]) / n1 + var(Y[Z == 0]) / n0
+
+      ## integer counts (round kills 299.9999 → 300)
+      na1 <- as.integer(round(na * split_setting[split_index]))
+      nb1 <- n1 - na1
+      na0 <- na - na1
+      nb0 <- nb - nb1
+
+      S1 <- sample(c(rep("a", na1), rep("b", nb1)), size = n1)
+      S0 <- sample(c(rep("a", na0), rep("b", nb0)), size = n0)
+
+      S <- rep(NA_character_, n)
+      S[Z == 1] <- S1
+      S[Z == 0] <- S0
+
+      full_data    <- data.frame(Y, Z, X1, X2, S)
+      full_data_cf <- full_data
+
+      form <- paste0("Y~", paste0("X", 1:px, collapse = "+"))
+      glm_fit_a1 <- glm(form, data = full_data %>% filter(S=="a" & Z==1), family="poisson")
+      glm_fit_a0 <- glm(form, data = full_data %>% filter(S=="a" & Z==0), family="poisson")
+      glm_fit_b1 <- glm(form, data = full_data %>% filter(S=="b" & Z==1), family="poisson")
+      glm_fit_b0 <- glm(form, data = full_data %>% filter(S=="b" & Z==0), family="poisson")
+
+      pred_a1_of <- predict(glm_fit_a1, newdata = full_data %>% filter(S=="a"), type="response")
+      pred_a0_of <- predict(glm_fit_a0, newdata = full_data %>% filter(S=="a"), type="response")
+      pred_b1_of <- predict(glm_fit_b1, newdata = full_data %>% filter(S=="b"), type="response")
+      pred_b0_of <- predict(glm_fit_b0, newdata = full_data %>% filter(S=="b"), type="response")
+
+      pred1 <- rep(NA_real_, n); pred0 <- rep(NA_real_, n)
+      pred1[S=="a"] <- pred_a1_of; pred0[S=="a"] <- pred_a0_of
+      pred1[S=="b"] <- pred_b1_of; pred0[S=="b"] <- pred_b0_of
+      full_data <- cbind(full_data, pred1, pred0)
+
+      ## cross-fit
+      pred_a1_cf <- predict(glm_fit_b1, newdata = full_data %>% filter(S=="a"), type="response")
+      pred_a0_cf <- predict(glm_fit_b0, newdata = full_data %>% filter(S=="a"), type="response")
+      pred_b1_cf <- predict(glm_fit_a1, newdata = full_data %>% filter(S=="b"), type="response")
+      pred_b0_cf <- predict(glm_fit_a0, newdata = full_data %>% filter(S=="b"), type="response")
+      pred1[S=="a"] <- pred_a1_cf; pred0[S=="a"] <- pred_a0_cf
+      pred1[S=="b"] <- pred_b1_cf; pred0[S=="b"] <- pred_b0_cf
+      full_data_cf <- cbind(full_data_cf, pred1, pred0)
+
+      ## linear calibration
+      lm_fit_a1 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="a" & Z==1))
+      lm_fit_a0 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="a" & Z==0))
+      lm_fit_b1 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="b" & Z==1))
+      lm_fit_b0 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="b" & Z==0))
+
+      pred_a1_cf_lc <- predict(lm_fit_b1, newdata = full_data_cf %>% filter(S=="a"))
+      pred_a0_cf_lc <- predict(lm_fit_b0, newdata = full_data_cf %>% filter(S=="a"))
+      pred_b1_cf_lc <- predict(lm_fit_a1, newdata = full_data_cf %>% filter(S=="b"))
+      pred_b0_cf_lc <- predict(lm_fit_a0, newdata = full_data_cf %>% filter(S=="b"))
+
+      pred1_lc <- rep(NA_real_, n); pred0_lc <- rep(NA_real_, n)
+      pred1_lc[S=="a"] <- pred_a1_cf_lc; pred0_lc[S=="a"] <- pred_a0_cf_lc
+      pred1_lc[S=="b"] <- pred_b1_cf_lc; pred0_lc[S=="b"] <- pred_b0_cf_lc
+      full_data_cf <- cbind(full_data_cf, pred1_lc, pred0_lc)
+
+      epsilon <- ifelse(Z==1, Y - pred1_lc, Y - pred0_lc)
+      full_data_cf$epsilon <- epsilon
+
+      mu_cf_a1 <- 1/na * sum(epsilon[S=="a" & Z==1])/(na1/na) +
+                  1/na * sum(pred1_lc[S=="a"])
+      mu_cf_a0 <- 1/na * sum(epsilon[S=="a" & Z==0])/(na0/na) +
+                  1/na * sum(pred0_lc[S=="a"])
+      mu_cf_b1 <- 1/nb * sum(epsilon[S=="b" & Z==1])/(nb1/nb) +
+                  1/nb * sum(pred1_lc[S=="b"])
+      mu_cf_b0 <- 1/nb * sum(epsilon[S=="b" & Z==0])/(nb0/nb) +
+                  1/nb * sum(pred0_lc[S=="b"])
+
+      tau_hat_cf <- na/n * (mu_cf_a1 - mu_cf_a0) + nb/n * (mu_cf_b1 - mu_cf_b0)
+      var_hat_cf <- na^2/n^2 * (var(epsilon[S=="a" & Z==1])/na1 +
+                                var(epsilon[S=="a" & Z==0])/na0) +
+                    nb^2/n^2 * (var(epsilon[S=="b" & Z==1])/nb1 +
+                                var(epsilon[S=="b" & Z==0])/nb0)
+
+      c(tau_hat_0  = tau_hat_0,
+        var_hat_0  = var_hat_0,
+        tau_hat_cf = tau_hat_cf,
+        var_hat_cf = var_hat_cf)
+    } # foreach
+    close(pb)
+
+    ## save correct-model
+    res_mat <- do.call(rbind, res)
+    result_correct_model[[split_index]]$tau        <- rep(tau, MC)
+    result_correct_model[[split_index]]$tau_hat_0  <- res_mat[, "tau_hat_0"]
+    result_correct_model[[split_index]]$var_hat_0  <- res_mat[, "var_hat_0"]
+    result_correct_model[[split_index]]$tau_hat_cf <- res_mat[, "tau_hat_cf"]
+    result_correct_model[[split_index]]$var_hat_cf <- res_mat[, "var_hat_cf"]
+  }
+
+  # ============== 2) WRONG-MODEL loop =======================================
+  for (split_index in seq_along(split_setting)) {
+
+    pb <- txtProgressBar(min = 0, max = MC, style = 3)
+    prog <- function(n) setTxtProgressBar(pb, n)
+    opts <- list(progress = prog)
+
+    res <- foreach(iter = 1:MC, .packages = "dplyr",
+                   .options.snow = opts) %dopar% {
+
+      ## ---- Monte-Carlo replicate (wrong model) ----
+      Z <- sample(c(rep(1L, n1), rep(0L, n0)))
+      Y <- Z * Y1 + (1 - Z) * Y0
+
+      tau_hat_0 <- mean(Y[Z==1]) - mean(Y[Z==0])
+      var_hat_0 <- var(Y[Z==1]) / n1 + var(Y[Z==0]) / n0
+
+      na1 <- as.integer(round(na * split_setting[split_index]))
+      nb1 <- n1 - na1
+      na0 <- na - na1
+      nb0 <- nb - nb1
+
+      S1 <- sample(c(rep("a", na1), rep("b", nb1)), size = n1)
+      S0 <- sample(c(rep("a", na0), rep("b", nb0)), size = n0)
+
+      S <- rep(NA_character_, n)
+      S[Z==1] <- S1
+      S[Z==0] <- S0
+
+      full_data    <- data.frame(Y, Z, X1, X2, S)
+      full_data_cf <- full_data
+
+      form <- paste0("Y~", paste0("X", 1:ceiling(px/2), collapse = "+"))
+      glm_fit_a1 <- glm(form, data = full_data %>% filter(S=="a" & Z==1), family="poisson")
+      glm_fit_a0 <- glm(form, data = full_data %>% filter(S=="a" & Z==0), family="poisson")
+      glm_fit_b1 <- glm(form, data = full_data %>% filter(S=="b" & Z==1), family="poisson")
+      glm_fit_b0 <- glm(form, data = full_data %>% filter(S=="b" & Z==0), family="poisson")
+
+      pred_a1_of <- predict(glm_fit_a1, newdata = full_data %>% filter(S=="a"), type="response")
+      pred_a0_of <- predict(glm_fit_a0, newdata = full_data %>% filter(S=="a"), type="response")
+      pred_b1_of <- predict(glm_fit_b1, newdata = full_data %>% filter(S=="b"), type="response")
+      pred_b0_of <- predict(glm_fit_b0, newdata = full_data %>% filter(S=="b"), type="response")
+
+      pred1 <- rep(NA_real_, n); pred0 <- rep(NA_real_, n)
+      pred1[S=="a"] <- pred_a1_of; pred0[S=="a"] <- pred_a0_of
+      pred1[S=="b"] <- pred_b1_of; pred0[S=="b"] <- pred_b0_of
+      full_data <- cbind(full_data, pred1, pred0)
+
+      ## cross-fit
+      pred_a1_cf <- predict(glm_fit_b1, newdata = full_data %>% filter(S=="a"), type="response")
+      pred_a0_cf <- predict(glm_fit_b0, newdata = full_data %>% filter(S=="a"), type="response")
+      pred_b1_cf <- predict(glm_fit_a1, newdata = full_data %>% filter(S=="b"), type="response")
+      pred_b0_cf <- predict(glm_fit_a0, newdata = full_data %>% filter(S=="b"), type="response")
+      pred1[S=="a"] <- pred_a1_cf; pred0[S=="a"] <- pred_a0_cf
+      pred1[S=="b"] <- pred_b1_cf; pred0[S=="b"] <- pred_b0_cf
+      full_data_cf <- cbind(full_data_cf, pred1, pred0)
+
+      ## calibration
+      lm_fit_a1 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="a" & Z==1))
+      lm_fit_a0 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="a" & Z==0))
+      lm_fit_b1 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="b" & Z==1))
+      lm_fit_b0 <- lm(Y ~ pred1 + pred0, data = full_data %>% filter(S=="b" & Z==0))
+
+      pred_a1_cf_lc <- predict(lm_fit_b1, newdata = full_data_cf %>% filter(S=="a"))
+      pred_a0_cf_lc <- predict(lm_fit_b0, newdata = full_data_cf %>% filter(S=="a"))
+      pred_b1_cf_lc <- predict(lm_fit_a1, newdata = full_data_cf %>% filter(S=="b"))
+      pred_b0_cf_lc <- predict(lm_fit_a0, newdata = full_data_cf %>% filter(S=="b"))
+
+      pred1_lc <- rep(NA_real_, n); pred0_lc <- rep(NA_real_, n)
+      pred1_lc[S=="a"] <- pred_a1_cf_lc; pred0_lc[S=="a"] <- pred_a0_cf_lc
+      pred1_lc[S=="b"] <- pred_b1_cf_lc; pred0_lc[S=="b"] <- pred_b0_cf_lc
+      full_data_cf <- cbind(full_data_cf, pred1_lc, pred0_lc)
+
+      epsilon <- ifelse(Z==1, Y - pred1_lc, Y - pred0_lc)
+      full_data_cf$epsilon <- epsilon
+
+      mu_cf_a1 <- 1/na * sum(epsilon[S=="a"&Z==1])/(na1/na) +
+                  1/na * sum(pred1_lc[S=="a"])
+      mu_cf_a0 <- 1/na * sum(epsilon[S=="a"&Z==0])/(na0/na) +
+                  1/na * sum(pred0_lc[S=="a"])
+      mu_cf_b1 <- 1/nb * sum(epsilon[S=="b"&Z==1])/(nb1/nb) +
+                  1/nb * sum(pred1_lc[S=="b"])
+      mu_cf_b0 <- 1/nb * sum(epsilon[S=="b"&Z==0])/(nb0/nb) +
+                  1/nb * sum(pred0_lc[S=="b"])
+
+      tau_hat_cf <- na/n * (mu_cf_a1 - mu_cf_a0) + nb/n * (mu_cf_b1 - mu_cf_b0)
+      var_hat_cf <- na^2/n^2 * (var(epsilon[S=="a"&Z==1])/na1 +
+                                var(epsilon[S=="a"&Z==0])/na0) +
+                    nb^2/n^2 * (var(epsilon[S=="b"&Z==1])/nb1 +
+                                var(epsilon[S=="b"&Z==0])/nb0)
+
+      c(tau_hat_0  = tau_hat_0,
+        var_hat_0  = var_hat_0,
+        tau_hat_cf = tau_hat_cf,
+        var_hat_cf = var_hat_cf)
+    } # foreach
+    close(pb)
+
+    ## save wrong-model
+    res_mat <- do.call(rbind, res)
+    result_wrong_model[[split_index]]$tau        <- rep(tau, MC)
+    result_wrong_model[[split_index]]$tau_hat_0  <- res_mat[, "tau_hat_0"]
+    result_wrong_model[[split_index]]$var_hat_0  <- res_mat[, "var_hat_0"]
+    result_wrong_model[[split_index]]$tau_hat_cf <- res_mat[, "tau_hat_cf"]
+    result_wrong_model[[split_index]]$var_hat_cf <- res_mat[, "var_hat_cf"]
+  }
+
+  ## stash this seed’s outputs -----------------------------------------------
+  all_runs[[s]] <- list(seed = seed_val,
+                        result_correct_model = result_correct_model,
+                        result_wrong_model   = result_wrong_model)
+
+  message("… finished seed ", seed_val)
+}
+
+# ───────────────────────  Tidy-up  ────────────────────────
+stopCluster(cl)
+saveRDS(all_runs, file = "cre_parallel_50seeds_results.rds")
+
+
+```
+
+```{r}
+# ────────────────── 1  Libraries ──────────────────
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+
+# ────────────────── 2  Load simulation file ──────────────────
+all_runs <- readRDS("cre_parallel_50seeds_results.rds")
+split_setting <- c(0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+
+# ────────────────── 3  Helper: summarise one seed ──────────────────
+summarise_seed <- function(seed_list, which = c("correct", "wrong")) {
+  which <- match.arg(which)
+  res_list <- seed_list[[paste0("result_", which, "_model")]]
+
+  map2_dfr(res_list, split_setting, function(df, ss) {
+    tibble(
+      split_setting = ss,
+      var_tau_hat_cf  = var(df$tau_hat_cf),
+      mean_var_hat_cf = mean(df$var_hat_cf),
+      var_tau_hat_0   = var(df$tau_hat_0),
+      mean_var_hat_0  = mean(df$var_hat_0)
+    )
+  })
+}
+
+# ────────────────── 4  Per-seed summaries ──────────────────
+correct_seed <- imap_dfr(all_runs,
+  ~ summarise_seed(.x, "correct") %>% mutate(model = "correct", seed = .y)
+)
+wrong_seed <- imap_dfr(all_runs,
+  ~ summarise_seed(.x, "wrong") %>% mutate(model = "wrong", seed = .y)
+)
+
+# ────────────────── 5  Median over seeds ──────────────────
+median_by_split <- bind_rows(correct_seed, wrong_seed) %>%
+  group_by(model, split_setting) %>%
+  summarise(
+    var_tau_hat_cf   = median(var_tau_hat_cf),
+    mean_var_hat_cf  = median(mean_var_hat_cf),
+    .groups = "drop"
+  )
+
+# ── single overall medians for the baseline estimators (τ̂₀) ──
+hline_df <- bind_rows(correct_seed, wrong_seed) %>%
+#  group_by(model) %>%
+  summarise(
+    var_tau_hat_0   = median(var_tau_hat_0),
+    mean_var_hat_0  = median(mean_var_hat_0),
+    .groups = "drop"
+  ) %>%
+  pivot_longer(cols = starts_with(c("var_", "mean_")),
+               names_to = "metric", values_to = "yintercept")
+
+# ────────────────── 6  Long data for ggplot ──────────────────
+plot_long <- median_by_split %>%
+  pivot_longer(cols = c(var_tau_hat_cf, mean_var_hat_cf),
+               names_to = "metric", values_to = "value")
+
+# manual aesthetic keys
+metric_levels <- c("var_tau_hat_cf", "mean_var_hat_cf",
+                   "var_tau_hat_0",  "mean_var_hat_0")
+linetype_map  <- c(var_tau_hat_cf  = "solid",
+                   mean_var_hat_cf = "dashed",
+                   var_tau_hat_0   = "solid",
+                   mean_var_hat_0  = "dashed")
+colour_map    <- c(correct = "#0072B2", wrong = "#D55E00")
+shape_map     <- c(correct = 16, wrong = 1)  # filled vs. open circle
+
+# ────────────────── 7  Plot ──────────────────
+ggplot(plot_long,
+       aes(x = split_setting,
+           y = value,
+           colour = model,
+           shape = model,
+           linetype = metric)) +
+  geom_line() +
+  geom_point(size = 2) +
+  ## horizontal references (τ̂₀)
+  geom_hline(yintercept = hline_df$yintercept[1], lty = 3) +
+  geom_hline(yintercept = hline_df$yintercept[2], lty = 4) +
+  scale_colour_manual(values = colour_map) +
+  scale_shape_manual(values = shape_map) +
+  scale_linetype_manual(values = linetype_map,
+                        breaks = c("var_tau_hat_cf", "mean_var_hat_cf"),
+                        labels = c("Var(τ̂ cf)", "Mean v̂ cf")) +
+  scale_x_continuous(breaks = split_setting) +
+  labs(
+    title = "Empirical variance vs. mean variance estimator\n(correct & wrong models)",
+    x     = "Split proportion (|S = \"a\"| / n₁)",
+    y     = "Median across 50 seeds",
+    colour = "Model",
+    shape  = "Model",
+    linetype = "Quantity"
+  ) +
+  theme_minimal(base_size = 13)
+
+```
+
+```{r}
+# ────────────────── 1. libraries & file ──────────────────
+library(dplyr)
+library(purrr)
+library(tidyr)
+library(ggplot2)
+
+all_runs <- readRDS("cre_parallel_50seeds_results.rds")
+split_setting <- c(0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8)
+
+# ────────────────── 2. helper: one-seed summary ──────────────────
+summarise_seed <- function(seed_list, which = c("correct", "wrong")) {
+  which <- match.arg(which)
+  res_list <- seed_list[[paste0("result_", which, "_model")]]
+
+  map2_dfr(res_list, split_setting, \(df, ss) {
+    tibble(
+      split_setting   = ss,
+      var_tau_hat_cf  = var(df$tau_hat_cf),
+      mean_var_hat_cf = mean(df$var_hat_cf),
+      var_tau_hat_0   = var(df$tau_hat_0),
+      mean_var_hat_0  = mean(df$var_hat_0)
+    )
+  })
+}
+
+# ────────────────── 3. summaries for every seed ──────────────────
+correct_seed <- imap_dfr(all_runs,
+  \(x, i) summarise_seed(x, "correct") |> mutate(model = "correct", seed = i)
+)
+wrong_seed <- imap_dfr(all_runs,
+  \(x, i) summarise_seed(x, "wrong") |> mutate(model = "wrong", seed = i)
+)
+
+# ────────────────── 4. median across seeds ──────────────────
+median_split <- bind_rows(correct_seed, wrong_seed) |>
+  group_by(model, split_setting) |>
+  summarise(
+    var_tau_hat_cf   = median(var_tau_hat_cf),
+    mean_var_hat_cf  = median(mean_var_hat_cf),
+    .groups = "drop"
+  )
+
+# baseline (τ̂₀) medians across *all* splits & seeds -----------
+hline_df <- bind_rows(correct_seed, wrong_seed) |>
+  group_by(model) |>
+  summarise(
+    var_tau_hat_0   = median(var_tau_hat_0),
+    mean_var_hat_0  = median(mean_var_hat_0),
+    .groups = "drop"
+  ) |>
+  pivot_longer(cols = starts_with(c("var_", "mean_")),
+               names_to = "metric", values_to = "yintercept")
+
+# ────────────────── 5. long format for ggplot ──────────────────
+plot_long <- median_split |>
+  pivot_longer(cols = c(var_tau_hat_cf, mean_var_hat_cf),
+               names_to = "metric", values_to = "value")
+
+
+# ---------------- 2.  y-intercepts for BOTH panels ----------------
+lines_df <- hline_df %>% 
+  filter(metric %in% c("mean_var_hat_0", "var_tau_hat_0")) %>% 
+  mutate(
+    metric = case_when(
+      metric == "var_tau_hat_0"  ~ "var_tau_hat_cf",
+      metric == "mean_var_hat_0" ~ "mean_var_hat_cf"
+    )
+  ) %>% 
+  group_by(metric) %>% 
+  summarise(yint = median(yintercept), .groups = "drop")
+
+plot_levels <- c("var_tau_hat_cf", "mean_var_hat_cf")   # left → right
+metric_labels <- setNames(c("True Variance", "Estimated Variance"), plot_levels)       # keep blank strips
+
+plot_long <- plot_long %>%
+  mutate(metric = factor(metric, levels = plot_levels))
+
+lines_df  <- lines_df %>%              # <── add this conversion
+  mutate(metric = factor(metric, levels = plot_levels))
+
+# ---------------- 3.  plot ----------------
+fontsize = 30
+
+plot_split = ggplot(plot_long,
+                   aes(x = split_setting, y = value,
+                       colour = model, shape = model, group = model)) +
+  geom_line() +
+  geom_point(size = 3) +
+  geom_hline(data = lines_df,                   # <── adds both ref lines
+             aes(yintercept = yint),
+             linetype = "dashed", linewidth = 1.5, colour = "grey40") +
+  facet_wrap(~ metric, labeller = labeller(metric = metric_labels), nrow = 1) +
+  scale_colour_manual(values = colour_map) +
+  scale_shape_manual(values = shape_map) +
+  scale_x_continuous(breaks = split_setting) +
+  labs(
+    #    title    = "Median variance behaviour vs. split proportion",,
+    x        = "Split proportion",
+    y        = "True/Estimated variance",
+    colour   = "Model",
+    shape    = "Model"
+  ) +
+  theme_minimal(base_size = fontsize) +
+  theme(plot.title  = element_text(face = "bold", hjust = .5),
+        axis.title  = element_text(face = "bold"),
+        legend.text  = element_text(face = "bold", size = fontsize),
+        legend.title  = element_text(face = "bold", size = fontsize),
+        axis.text.x = element_text(face = "bold", size = fontsize), 
+        axis.text.y = element_text(face = "bold", size = fontsize),
+        strip.text      = element_text(face = "bold", size = fontsize))
+
+plot_split
+```
+
+```{r}
+ggsave("plot_split.png",
+       plot   = plot_split,
+       width  = 15,          # inches
+       height = 6,      # inches
+       units  = "in",
+       dpi    = 300, 
+       bg     = "white")
+```
+
